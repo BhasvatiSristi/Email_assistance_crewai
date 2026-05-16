@@ -16,9 +16,11 @@ from typing import Any, Dict, List
 from dotenv import load_dotenv
 
 from services.email_service import EmailMessage, fetch_mock_emails
+from services.gmail_service import fetch_gmail_emails
 from services.parser_service import ParseError, parse_json_output
 from output_formatter import print_concise_email
 from email_intelligence_crew import build_email_intelligence_crew
+import time
 
 load_dotenv()
 
@@ -74,18 +76,38 @@ def main() -> None:
         return
 
     model_name = os.getenv("MODEL_NAME", "llama-3.1-8b-instant")
+    # Mitigation settings to reduce tokens per minute
+    max_body_chars = int(os.getenv("MAX_EMAIL_BODY_CHARS", "2000"))
+    sleep_between_requests = float(os.getenv("SLEEP_BETWEEN_REQUESTS", "1.0"))
 
-    # Build the crew once
-    crew = build_email_intelligence_crew(model=model_name)
+    # Build the crew once (fail gracefully if crewai is not installed)
+    try:
+        crew = build_email_intelligence_crew(model=model_name)
+    except ModuleNotFoundError as exc:
+        print("crewai package not found. Install crewai in your environment to run the agents.")
+        print("Run: pip install crewai")
+        return
+
+    use_gmail = os.getenv("USE_GMAIL", "false").lower() in ("1", "true", "yes")
+    if use_gmail:
+        print("Using Gmail as email source (USE_GMAIL=true)")
+        emails = fetch_gmail_emails(max_items=max_items)
+    else:
+        emails = fetch_mock_emails(max_items=max_items)
 
     for email in emails:
         try:
+            # Truncate long email bodies to reduce token usage
+            body = email.body or ""
+            if len(body) > max_body_chars:
+                body = body[:max_body_chars] + "\n\n[truncated]"
+
             # Execute crew with email data as input
             crew_result = crew.kickoff(
                 inputs={
                     "subject": email.subject,
                     "sender": email.sender,
-                    "body": email.body,
+                    "body": body,
                 }
             )
 
@@ -124,6 +146,10 @@ def main() -> None:
                             action_items.append(item)
 
             print_concise_email(email.subject, summary, importance, action_items)
+
+            # Throttle to avoid exceeding tokens-per-minute limits
+            if sleep_between_requests > 0:
+                time.sleep(sleep_between_requests)
 
         except (RuntimeError, ParseError) as exc:
             print_concise_email(email.subject, [], "UNKNOWN", [])
