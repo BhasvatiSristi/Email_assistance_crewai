@@ -1,96 +1,137 @@
-"""Entry point for AI Email Intelligence Assistant V1."""
+"""Email Intelligence Assistant V1 - uses CrewAI.
+
+Prints concise email analysis:
+- EMAIL SUBJECT
+- SUMMARY (2-3 bullets)
+- IMPORTANCE
+- ACTION ITEMS
+"""
 
 from __future__ import annotations
 
+import os
+import json
 from typing import Any, Dict, List
 
-from config.settings import get_crewai_model_string, get_settings, validate_required_env
-from crews.email_intelligence_crew import build_email_intelligence_crew, run_email_intelligence
+from dotenv import load_dotenv
+
 from services.email_service import EmailMessage, fetch_mock_emails
 from services.parser_service import ParseError, parse_json_output
-from tools.output_formatter import print_email_analysis
+from output_formatter import print_concise_email
+from email_intelligence_crew import build_email_intelligence_crew
+
+load_dotenv()
 
 
-def _normalize_task_outputs(raw_result: Any) -> List[str]:
-    """
-    Convert CrewAI result object into a list of task output strings.
-
-    CrewAI versions can return different result objects. This helper keeps the project
-    resilient across minor version changes.
-    """
-    if hasattr(raw_result, "tasks_output") and raw_result.tasks_output:
-        normalized = []
-        for item in raw_result.tasks_output:
-            if hasattr(item, "raw"):
-                normalized.append(str(item.raw))
-            else:
-                normalized.append(str(item))
-        return normalized
-
-    # Fallback: when full result is only a final text response.
-    return [str(raw_result)]
-
-
-def _build_email_payload(email: EmailMessage) -> Dict[str, str]:
-    return {
-        "subject": email.subject,
-        "sender": email.sender,
-        "body": email.body,
+def _extract_crew_results(crew_result: Any) -> Dict[str, Any]:
+    """Extract task outputs from CrewAI crew execution result."""
+    results = {
+        "summary": {},
+        "importance": {},
+        "actions": {},
     }
+
+    # Crew result can have tasks_output attribute
+    if hasattr(crew_result, "tasks_output") and crew_result.tasks_output:
+        task_outputs = crew_result.tasks_output
+        if len(task_outputs) > 0:
+            try:
+                results["summary"] = parse_json_output(str(task_outputs[0].raw or task_outputs[0]))
+            except (ParseError, AttributeError, IndexError):
+                pass
+
+        if len(task_outputs) > 1:
+            try:
+                results["importance"] = parse_json_output(str(task_outputs[1].raw or task_outputs[1]))
+            except (ParseError, AttributeError, IndexError):
+                pass
+
+        if len(task_outputs) > 2:
+            try:
+                results["actions"] = parse_json_output(str(task_outputs[2].raw or task_outputs[2]))
+            except (ParseError, AttributeError, IndexError):
+                pass
+
+    # Fallback: crew_result might be a string
+    elif isinstance(crew_result, str):
+        try:
+            data = json.loads(crew_result)
+            results["summary"] = data.get("summary", {})
+            results["importance"] = data.get("importance", {})
+            results["actions"] = data.get("actions", {})
+        except json.JSONDecodeError:
+            pass
+
+    return results
 
 
 def main() -> None:
-    settings = get_settings()
-    missing_vars = validate_required_env(settings)
+    max_items = int(os.getenv("MAX_MOCK_EMAILS", "3"))
+    emails: List[EmailMessage] = fetch_mock_emails(max_items=max_items)
 
-    if missing_vars:
-        missing = ", ".join(missing_vars)
-        raise RuntimeError(f"Missing required environment variables: {missing}")
-
-    model = get_crewai_model_string(settings)
-    crew = build_email_intelligence_crew(model=model)
-
-    emails = fetch_mock_emails(max_items=settings.max_mock_emails)
     if not emails:
-        print("No emails found.")
+        print("No emails to analyze.")
         return
 
-    print(f"Running Email Intelligence Assistant V1 on {len(emails)} email(s)...\n")
+    model_name = os.getenv("MODEL_NAME", "llama-3.1-8b-instant")
+
+    # Build the crew once
+    crew = build_email_intelligence_crew(model=model_name)
 
     for email in emails:
-        payload = _build_email_payload(email)
-
         try:
-            raw_result = run_email_intelligence(crew, payload)
-            task_outputs = _normalize_task_outputs(raw_result)
+            # Execute crew with email data as input
+            crew_result = crew.kickoff(
+                inputs={
+                    "subject": email.subject,
+                    "sender": email.sender,
+                    "body": email.body,
+                }
+            )
 
-            # Expected order matches the task list in the crew.
-            summary = parse_json_output(task_outputs[0]) if len(task_outputs) > 0 else {}
-            importance = parse_json_output(task_outputs[1]) if len(task_outputs) > 1 else {}
-            classification = parse_json_output(task_outputs[2]) if len(task_outputs) > 2 else {}
-            actions = parse_json_output(task_outputs[3]) if len(task_outputs) > 3 else {}
+            results = _extract_crew_results(crew_result)
 
-            result = {
-                "summary": summary,
-                "importance": importance,
-                "classification": classification,
-                "actions": actions,
-            }
+            # Extract and normalize summary
+            summary = results["summary"].get("summary_bullets", [])
+            if not isinstance(summary, list):
+                summary = []
+            if len(summary) > 3:
+                first_two = summary[:2]
+                third = " ".join(s.strip() for s in summary[2:])
+                summary = first_two + [third]
 
-            print_email_analysis(email.subject, result)
+            # Extract and normalize importance
+            importance = "UNKNOWN"
+            if isinstance(results["importance"], dict):
+                importance = results["importance"].get("importance", "UNKNOWN")
+                if isinstance(importance, str):
+                    importance = importance.strip().upper()
 
-        except ParseError as exc:
-            print("=" * 72)
-            print(f"EMAIL SUBJECT: {email.subject}")
-            print("Analysis failed while parsing agent output.")
-            print(f"Error: {exc}")
-            print("=" * 72)
-        except Exception as exc:  # Broad catch to keep batch processing robust.
-            print("=" * 72)
-            print(f"EMAIL SUBJECT: {email.subject}")
-            print("Unexpected error while analyzing this email.")
-            print(f"Error: {exc}")
-            print("=" * 72)
+            # Extract and normalize action items
+            action_items = []
+            if isinstance(results["actions"], dict):
+                raw_actions = results["actions"].get("action_items", [])
+                if isinstance(raw_actions, list):
+                    for item in raw_actions:
+                        if isinstance(item, dict):
+                            desc = item.get("description", "")
+                            deadline = item.get("deadline", "")
+                            if desc and deadline:
+                                action_items.append(f"{desc} by {deadline}")
+                            elif desc:
+                                action_items.append(desc)
+                        elif isinstance(item, str):
+                            action_items.append(item)
+
+            print_concise_email(email.subject, summary, importance, action_items)
+
+        except (RuntimeError, ParseError) as exc:
+            print_concise_email(email.subject, [], "UNKNOWN", [])
+            print(f"[warning] {exc}")
+
+        except Exception as exc:
+            print_concise_email(email.subject, [], "UNKNOWN", [])
+            print(f"[unexpected error] {exc}")
 
 
 if __name__ == "__main__":
