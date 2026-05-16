@@ -19,6 +19,7 @@ from services.email_service import EmailMessage, fetch_mock_emails
 from services.gmail_service import fetch_gmail_emails
 from services.parser_service import ParseError, parse_json_output
 from output_formatter import print_concise_email
+from services.notification_service import notify
 from email_intelligence_crew import build_email_intelligence_crew
 import time
 
@@ -146,6 +147,16 @@ def main() -> None:
                             action_items.append(item)
 
             print_concise_email(email.subject, summary, importance, action_items)
+
+            # Send notification if enabled
+            use_notify = os.getenv("USE_NOTIFY", "false").lower() in ("1", "true", "yes")
+            if use_notify:
+                try:
+                    ok = notify(email.subject, summary, importance, action_items)
+                    if not ok:
+                        print(f"[warning] notification failed for: {email.subject}")
+                except Exception as exc:
+                    print(f"[warning] notification error: {exc}")
 
             # Throttle to avoid exceeding tokens-per-minute limits
             if sleep_between_requests > 0:
